@@ -974,6 +974,10 @@ def extract_file(
                     map_info = mi
                 ni = _iget(gid, "Ni")
                 nj = _iget(gid, "Nj")
+                # bitmapped points (e.g. the ERA5 sea-ice cover over land) must carry the WPS
+                # missing flag -1.E30 so metgrid discards them; without this ecCodes substitutes
+                # its default placeholder 9999., which metgrid treats as valid data
+                eccodes.codes_set(gid, "missingValue", -1.0e30)
                 vals = np.asarray(eccodes.codes_get_values(gid), dtype=np.float64)
                 slab = values_to_slab(vals, ni, nj)
                 if (ni, nj) != (mi.nx, mi.ny):
