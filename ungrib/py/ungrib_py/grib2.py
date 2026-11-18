@@ -50,6 +50,22 @@ _SOILT_SHALLOW_FIRST: tuple[str, ...] = (
 
 _GRAVITY_M_S2: float = 9.81
 
+# WPS missing flag of the intermediate format and the threshold below which a value counts as missing
+_MISSING_VALUE: float = -1.0e30
+_MISSING_THRESHOLD: float = -1.0e29
+
+# level code of surface fields in the intermediate format
+_SURFACE_LEVEL: float = 200100.0
+
+# constants of the relative humidity calculations of the Fortran rrpr
+_SVP1: float = 611.2
+_SVP2: float = 17.67
+_SVP3: float = 29.65
+_SVPT0: float = 273.15
+_EPS: float = 0.622
+_XLV: float = 2.5e6
+_RV: float = 461.5
+
 
 def _is_pressure_level_pa(lev: float) -> bool:
 
@@ -114,6 +130,117 @@ def ensure_hgt_from_geopt(
         )
         del bucket[key]
 
+def _field_meta_from_vtable(
+    rows: list[VtableEntry] | None,
+    name: str,
+    default_units: str,
+    default_desc: str,
+) -> tuple[str, str, str]:
+
+    # This function returns (name, units, desc) for a derived field, preferring the first Vtable row of this name that has a description.
+
+    matching = [r for r in (rows or []) if r.name.strip() == name and r.desc.strip()]
+    if matching:
+        return (matching[0].name[:9].ljust(9)[:9], matching[0].units[:25], matching[0].desc[:46])
+    return (name.ljust(9)[:9], default_units.ljust(25)[:25], default_desc.ljust(46)[:46])
+
+def _mask_missing(result: np.ndarray, inputs: tuple[np.ndarray, ...]) -> np.ndarray:
+
+    # This function sets a derived slab to the WPS missing flag wherever one of its input slabs is missing and converts it to a Fortran-ordered float32 array.
+
+    missing = np.any([np.asarray(x) <= _MISSING_THRESHOLD for x in inputs], axis=0)
+    return np.asfortranarray(np.where(missing, _MISSING_VALUE, result).astype(np.float32))
+
+def rh_from_spechumd(
+    temperature: np.ndarray,
+    pressure: np.ndarray | float,
+    spechumd: np.ndarray,
+) -> np.ndarray:
+
+    # This function calculates the relative humidity in % from the temperature in K, the pressure in Pa and the specific humidity in kg/kg (Fortran rrpr compute_rh_spechumd).
+
+    t = np.asarray(temperature, dtype=np.float64)
+    q = np.asarray(spechumd, dtype=np.float64)
+    p = np.asarray(pressure, dtype=np.float64)
+    with np.errstate(all="ignore"):
+        return 1.0e2 * (p * q / (q * (1.0 - _EPS) + _EPS)) / (
+            _SVP1 * np.exp(_SVP2 * (t - _SVPT0) / (t - _SVP3))
+        )
+
+def rh_from_dewpoint(temperature: np.ndarray, dewpoint: np.ndarray) -> np.ndarray:
+
+    # This function calculates the relative humidity in % from the temperature and the dewpoint in K (Fortran rrpr compute_rh_dewpt).
+
+    t = np.asarray(temperature, dtype=np.float64)
+    td = np.asarray(dewpoint, dtype=np.float64)
+    with np.errstate(all="ignore"):
+        return np.exp(_XLV / _RV * (1.0 / t - 1.0 / td)) * 1.0e2
+
+def ensure_rh_from_spechumd_or_dewpt(
+    bucket: dict[tuple[float, str], FieldSlab],
+    *,
+    vtable_rows: list[VtableEntry] | None = None,
+) -> None:
+
+    # This function adds the RH slabs that are missing by deriving them from SPECHUMD (upper air and surface) or DEWPT (surface), which must happen before the fields with a blank Vtable description are dropped (Fortran rrpr).
+
+    name9, units25, desc46 = _field_meta_from_vtable(vtable_rows, "RH", "%", "Relative Humidity")
+
+    def rh_slab(level: float, data: np.ndarray) -> FieldSlab:
+
+        # This function wraps a derived relative humidity array into a field slab of the given level.
+
+        return FieldSlab(name=name9, units=units25, desc=desc46, level=level, data=data)
+
+    # upper air: on model levels (level index below 200) the pressure is a field, on isobaric levels it is the level itself
+    for lev in sorted({k[0] for k in bucket if float(k[0]) < 200000.0}):
+        if (lev, "RH") in bucket or (lev, "TT") not in bucket or (lev, "SPECHUMD") not in bucket:
+            continue
+        on_model_level = int(round(float(lev))) < 200
+        if on_model_level and (lev, "PRESSURE") not in bucket:
+            continue
+        t = bucket[(lev, "TT")].data
+        q = bucket[(lev, "SPECHUMD")].data
+        p = bucket[(lev, "PRESSURE")].data if on_model_level else float(lev)
+        rh = rh_from_spechumd(t, p, np.maximum(np.asarray(q, dtype=np.float64), 1.0e-10))
+        bucket[(lev, "RH")] = rh_slab(float(lev), _mask_missing(rh, (t, q, p) if on_model_level else (t, q)))
+
+    # surface
+    sfc = _SURFACE_LEVEL
+    if (sfc, "RH") in bucket or (sfc, "TT") not in bucket:
+        return
+    t = bucket[(sfc, "TT")].data
+    if (sfc, "PSFC") in bucket and (sfc, "SPECHUMD") in bucket:
+        p = bucket[(sfc, "PSFC")].data
+        q = bucket[(sfc, "SPECHUMD")].data
+        bucket[(sfc, "RH")] = rh_slab(sfc, _mask_missing(rh_from_spechumd(t, p, q), (t, p, q)))
+    elif (sfc, "DEWPT") in bucket:
+        td = bucket[(sfc, "DEWPT")].data
+        bucket[(sfc, "RH")] = rh_slab(sfc, _mask_missing(rh_from_dewpoint(t, td), (t, td)))
+
+def ensure_snow_from_snow_ec(
+    bucket: dict[tuple[float, str], FieldSlab],
+    *,
+    vtable_rows: list[VtableEntry] | None = None,
+) -> None:
+
+    # This function derives the snow water equivalent SNOW in kg m-2 from the ECMWF snow depth SNOW_EC in m of water equivalent, which must happen before the fields with a blank Vtable description are dropped (Fortran rrpr).
+
+    sfc = _SURFACE_LEVEL
+    if (sfc, "SNOW_EC") not in bucket:
+        return
+    name9, units25, desc46 = _field_meta_from_vtable(
+        vtable_rows, "SNOW", "kg m-2", "Water Equivalent of Accumulated Snow Depth"
+    )
+    snow_ec = bucket[(sfc, "SNOW_EC")].data
+    snow = 1000.0 * np.asarray(snow_ec, dtype=np.float64)
+    bucket[(sfc, "SNOW")] = FieldSlab(
+        name=name9,
+        units=units25,
+        desc=desc46,
+        level=sfc,
+        data=_mask_missing(snow, (snow_ec,)),
+    )
 
 def drop_fields_blank_vtable_desc(
     bucket: dict[tuple[float, str], FieldSlab],

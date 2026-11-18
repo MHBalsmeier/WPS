@@ -9,6 +9,8 @@ from pathlib import Path
 from ungrib_py.grib2 import (
     drop_fields_blank_vtable_desc,
     ensure_hgt_from_geopt,
+    ensure_rh_from_spechumd_or_dewpt,
+    ensure_snow_from_snow_ec,
     ensure_soilhgt_from_soilgeo,
     ensure_soilt000_for_metgrid,
     extract_file,
@@ -92,6 +94,8 @@ def merge_by_time(
         ensure_soilt000_for_metgrid(bucket)
         ensure_soilhgt_from_soilgeo(bucket)
         ensure_hgt_from_geopt(bucket, vtable_rows=all_vtable_rows)
+        ensure_rh_from_spechumd_or_dewpt(bucket, vtable_rows=all_vtable_rows)
+        ensure_snow_from_snow_ec(bucket, vtable_rows=all_vtable_rows)
         drop_fields_blank_vtable_desc(bucket, all_vtable_rows)
     return merged, map_ref
 
